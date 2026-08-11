@@ -50,6 +50,7 @@ SATELLITES = {
     "dad": "assist_satellite.dad_s_room_dad_room_satellite",
     "dadroom": "assist_satellite.dad_s_room_dad_room_satellite",
     "dad_room": "assist_satellite.dad_s_room_dad_room_satellite",
+    "tails1154": "assist_satellite.computer_turtle_beach_satellite",
     "turtle": "assist_satellite.computer_turtle_beach_satellite",
     "turtlebeach": "assist_satellite.computer_turtle_beach_satellite",
     "computer": "assist_satellite.computer_turtle_beach_satellite",
@@ -253,7 +254,7 @@ def satellite_announce(satellite: str, message: str) -> Dict[str, Any]:
 def satellite_list() -> Dict[str, Any]:
     """List available satellites and their entity ids."""
     return {"ok": True, "satellites": [
-        {"name": k, "entity": v} for k, v in SATELLITES.items() if k in ("dad", "turtle")
+        {"name": k, "entity": v} for k, v in SATELLITES.items() if k in ("dad", "tails1154")
     ]}
 
 
