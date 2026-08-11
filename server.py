@@ -261,6 +261,37 @@ def satellite_list() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# MQTT (rings the Pi alarm clock buzzer)
+# ---------------------------------------------------------------------------
+
+_mqtt_client = None
+_mqtt_lock = threading.Lock()
+
+
+def _mqtt_pub(topic: str, payload: str) -> bool:
+    global _mqtt_client
+    with _mqtt_lock:
+        if _mqtt_client is None:
+            try:
+                import paho.mqtt.client as mqtt  # noqa: PLC0415
+                c = mqtt.Client(client_id="claw_questions", protocol=mqtt.MQTTv311)
+                c.username_pw_set("serverstatus", "serverstatus")
+                c.connect("192.168.0.149", 1883, 5)
+                c.loop_start()
+                _mqtt_client = c
+            except Exception as e:  # noqa: BLE001
+                print(f"MQTT init failed: {e}", flush=True)
+                return False
+        try:
+            _mqtt_client.publish(topic, payload, qos=1, retain=False)
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"MQTT publish failed: {e}", flush=True)
+            _mqtt_client = None
+            return False
+
+
+# ---------------------------------------------------------------------------
 # Alarms & timers (run in-process; fire a TTS announce + optional music)
 # ---------------------------------------------------------------------------
 
@@ -278,6 +309,8 @@ def _fire_timer(tid: str) -> None:
     satellite = t.get("satellite", "tails1154")
     entity = SATELLITES.get(satellite.strip().lower())
     print(f"TIMER FIRED: {label}", flush=True)
+    # ring the Pi alarm clock buzzer (via MQTT) so the physical alarm sounds
+    _mqtt_pub("alarm/ring", "ring")
     if entity:
         _ha_call(
             "assist_satellite/announce",
