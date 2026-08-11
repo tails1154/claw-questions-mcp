@@ -268,6 +268,7 @@ _mqtt_client = None
 _mqtt_lock = threading.Lock()
 
 
+
 def _mqtt_pub(topic: str, payload: str) -> bool:
     global _mqtt_client
     with _mqtt_lock:
@@ -278,12 +279,14 @@ def _mqtt_pub(topic: str, payload: str) -> bool:
                 c.username_pw_set("serverstatus", "serverstatus")
                 c.connect("192.168.0.149", 1883, 5)
                 c.loop_start()
+                time.sleep(0.5)  # let the network loop establish
                 _mqtt_client = c
             except Exception as e:  # noqa: BLE001
                 print(f"MQTT init failed: {e}", flush=True)
                 return False
         try:
-            _mqtt_client.publish(topic, payload, qos=1, retain=False)
+            info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
+            info.wait_for_publish(timeout=5)
             return True
         except Exception as e:  # noqa: BLE001
             print(f"MQTT publish failed: {e}", flush=True)
@@ -300,9 +303,10 @@ _timer_seq = 0
 _timer_lock = threading.Lock()
 
 
-def _fire_timer(tid: str) -> None:
-    with _timer_lock:
-        t = _timers.get(tid)
+def _fire_timer(tid: str, t: Optional[Dict[str, Any]] = None) -> None:
+    if t is None:
+        with _timer_lock:
+            t = _timers.get(tid)
     if not t:
         return
     label = t.get("label") or "timer"
@@ -327,14 +331,14 @@ def _timer_worker() -> None:
         with _timer_lock:
             for tid, t in list(_timers.items()):
                 if not t.get("paused") and now >= t.get("due", 0):
-                    fired.append(tid)
-            for tid in fired:
+                    fired.append((tid, t))
+            for tid, t in fired:
                 t = _timers.pop(tid, None)
                 if t and t.get("repeat", 0) > 0:
                     t["due"] = now + t["repeat"]
                     _timers[tid] = t
-        for tid in fired:
-            _fire_timer(tid)
+        for tid, t in fired:
+            _fire_timer(tid, t)
         time.sleep(1)
 
 
