@@ -502,6 +502,82 @@ async def status(request: Request) -> Response:
 app.add_route("/status", status, methods=["GET"])
 
 
+# ---------------------------------------------------------------------------
+# HTTP API: alarms & timers (plain JSON, no MCP needed)
+# ---------------------------------------------------------------------------
+
+async def http_set_timer(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    try:
+        seconds = float(body.get("seconds", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "seconds must be a number"}, status_code=400)
+    result = set_timer(
+        seconds=seconds,
+        label=str(body.get("label", "timer")),
+        satellite=str(body.get("satellite", "tails1154")),
+    )
+    code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=code)
+
+
+async def http_set_alarm(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    result = set_alarm(
+        clock_time=str(body.get("clock_time", "")),
+        label=str(body.get("label", "alarm")),
+        satellite=str(body.get("satellite", "tails1154")),
+    )
+    code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=code)
+
+
+async def http_list_timers(request: Request) -> Response:
+    return JSONResponse(list_timers())
+
+
+async def http_cancel_timer(request: Request) -> Response:
+    timer_id = request.path_params.get("timer_id", "")
+    result = cancel_timer(timer_id)
+    code = 200 if result.get("ok") else 404
+    return JSONResponse(result, status_code=code)
+
+
+async def http_modify_timer(request: Request) -> Response:
+    timer_id = request.path_params.get("timer_id", "")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    result = modify_timer(
+        timer_id,
+        seconds=body.get("seconds"),
+        label=body.get("label"),
+        satellite=body.get("satellite"),
+    )
+    code = 200 if result.get("ok") else 404
+    return JSONResponse(result, status_code=code)
+
+
+async def http_dismiss(request: Request) -> Response:
+    _mqtt_pub("alarm/dismiss", "dismiss")
+    return JSONResponse({"ok": True, "dismissed": True})
+
+
+app.add_route("/timer", http_set_timer, methods=["POST"])
+app.add_route("/alarm", http_set_alarm, methods=["POST"])
+app.add_route("/timers", http_list_timers, methods=["GET"])
+app.add_route("/timer/{timer_id}", http_cancel_timer, methods=["DELETE"])
+app.add_route("/timer/{timer_id}", http_modify_timer, methods=["PATCH"])
+app.add_route("/dismiss", http_dismiss, methods=["POST"])
+
+
 def main() -> None:
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
