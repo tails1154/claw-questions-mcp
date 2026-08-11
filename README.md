@@ -73,6 +73,8 @@ needed**; works with any MQTT setup (Mosquitto add-on etc.).
 | `claw/alarm/set` | `{"clock_time": "07:30", "label": "...", "satellite": "..."}` or plain `07:30` | Set wall-clock alarm |
 | `claw/timer/cancel` | `{"id": "t1"}` or plain `t1` | Cancel timer/alarm by id |
 | `claw/timer/modify` | `{"id": "t1", "seconds": 600, "label": "..."}` | Modify timer |
+| `claw/timer/clear` | anything | Cancel ALL timers/alarms |
+| `claw/announce` | `{"satellite": "tails1154", "message": "..."}` or plain text | TTS on a satellite (used by the Pi alarm clock menu) |
 | `claw/dismiss` | anything | Stop the Pi buzzer |
 
 ### Status topics (server → HA)
@@ -91,6 +93,9 @@ needed**; works with any MQTT setup (Mosquitto add-on etc.).
 - `button.claw_questions_claw_dismiss_alarm` — stop the buzzer
 - `binary_sensor.claw_questions_claw_bridge_online` — bridge alive
 
+Plus, from the Pi alarm clock device itself: `binary_sensor.alarm_clock_alarm_ringing`,
+`button.alarm_clock_dismiss_alarm`, `button.alarm_clock_clear_all_timers`.
+
 Example HA automation (timer via MQTT publish):
 
 ```yaml
@@ -104,9 +109,23 @@ data:
 
 When a timer/alarm fires:
 
-1. Publishes MQTT `alarm/ring` → the Pi alarm clock buzzer rings until dismissed
-2. Announces TTS on the chosen satellite via HA `assist_satellite.announce`
-   ("Timer. {label}")
+1. Publishes MQTT `alarm/ring` → the Pi alarm clock buzzer rings (GPIO 22) until dismissed
+2. **No satellite TTS announce** — the physical buzzer IS the alarm
+
+Dismiss: short-press the Pi button (stops instantly, interrupts the tone mid-play), HA button
+`button.alarm_clock_dismiss_alarm`, MQTT `claw/dismiss`, or `POST /dismiss`.
+
+### Pi alarm clock button menu
+
+Hold the Pi button (1.2s) to open an options menu announced via TTS on the satellite
+(`claw/announce` → satellite TTS):
+
+- Hold again → next option
+- Short press → select current option
+- Options: `Clear all timers and alarms`, `Cancel`
+- Menu auto-closes after 20s idle
+
+Config via env: `HOLD_SECONDS`, `MENU_TIMEOUT`, `MENU_SATELLITE` on the Pi service.
 
 ### Satellite names
 
