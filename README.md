@@ -115,17 +115,8 @@ When a timer/alarm fires:
 Dismiss: short-press the Pi button (stops instantly, interrupts the tone mid-play), HA button
 `button.alarm_clock_dismiss_alarm`, MQTT `claw/dismiss`, or `POST /dismiss`.
 
-### Pi alarm clock button menu
-
-Hold the Pi button (1.2s) to open an options menu announced via TTS on the satellite
-(`claw/announce` → satellite TTS):
-
-- Hold again → next option
-- Short press → select current option
-- Options: `Clear all timers and alarms`, `Cancel`
-- Menu auto-closes after 20s idle
-
-Config via env: `HOLD_SECONDS`, `MENU_TIMEOUT`, `MENU_SATELLITE` on the Pi service.
+Clear everything: HA button `button.alarm_clock_clear_all_timers` (→ `claw/timer/clear`),
+MQTT `claw/timer/clear`, or HTTP `DELETE /timers`.
 
 ### Satellite names
 
