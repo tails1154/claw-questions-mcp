@@ -15,6 +15,7 @@ Music plays through the Turtle Beach satellite speaker (mpg123 -> pulse).
 import asyncio
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -287,6 +288,8 @@ TOPIC_TIMER_SET = "claw/timer/set"
 TOPIC_ALARM_SET = "claw/alarm/set"
 TOPIC_TIMER_CANCEL = "claw/timer/cancel"
 TOPIC_TIMER_MODIFY = "claw/timer/modify"
+TOPIC_TIMER_CLEAR = "claw/timer/clear"
+TOPIC_ANNOUNCE = "claw/announce"
 TOPIC_DISMISS = "claw/dismiss"
 TOPIC_TIMER_STATE = "claw/timers/state"
 TOPIC_STATUS = "claw/status"
@@ -296,6 +299,8 @@ SUB_TOPICS = [
     TOPIC_ALARM_SET,
     TOPIC_TIMER_CANCEL,
     TOPIC_TIMER_MODIFY,
+    TOPIC_TIMER_CLEAR,
+    TOPIC_ANNOUNCE,
     TOPIC_DISMISS,
 ]
 
@@ -477,62 +482,85 @@ def _payload_text(payload) -> str:
 
 
 def _mqtt_on_message(client, userdata, msg):
-    topic = msg.topic
-    payload = _payload_text(msg.payload)
-    try:
-        if topic == TOPIC_TIMER_SET:
-            data = None
-            try:
+    # paho calls this on its network loop thread — NEVER block it with
+    # wait_for_publish. Hand off to a worker thread instead.
+    _mqtt_command_queue.put((msg.topic, _payload_text(msg.payload)))
+
+
+def _mqtt_command_worker():
+    """Process MQTT commands on a dedicated thread (blocking publishes OK here)."""
+    while True:
+        topic, payload = _mqtt_command_queue.get()
+        try:
+            if topic == TOPIC_TIMER_SET:
+                data = None
+                try:
+                    data = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                if isinstance(data, dict):
+                    seconds = float(data.get("seconds", 0))
+                    label = str(data.get("label", "timer"))
+                    satellite = str(data.get("satellite", "tails1154"))
+                else:
+                    seconds = float(payload)
+                    label, satellite = "timer", "tails1154"
+                print(f"MQTT set_timer {seconds}s '{label}' -> {satellite}", flush=True)
+                set_timer(seconds, label, satellite)
+            elif topic == TOPIC_ALARM_SET:
+                data = None
+                try:
+                    data = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                if isinstance(data, dict):
+                    clock_time = str(data.get("clock_time", ""))
+                    label = str(data.get("label", "alarm"))
+                    satellite = str(data.get("satellite", "tails1154"))
+                else:
+                    clock_time, label, satellite = payload, "alarm", "tails1154"
+                print(f"MQTT set_alarm {clock_time} '{label}' -> {satellite}", flush=True)
+                set_alarm(clock_time, label, satellite)
+            elif topic == TOPIC_TIMER_CANCEL:
+                data = None
+                try:
+                    data = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                tid = data.get("id") if isinstance(data, dict) else payload
+                print(f"MQTT cancel_timer {tid}", flush=True)
+                cancel_timer(str(tid))
+            elif topic == TOPIC_TIMER_MODIFY:
                 data = json.loads(payload)
-            except Exception:  # noqa: BLE001
-                pass
-            if isinstance(data, dict):
-                seconds = float(data.get("seconds", 0))
-                label = str(data.get("label", "timer"))
-                satellite = str(data.get("satellite", "tails1154"))
-            else:
-                seconds = float(payload)
-                label, satellite = "timer", "tails1154"
-            print(f"MQTT set_timer {seconds}s '{label}' -> {satellite}", flush=True)
-            set_timer(seconds, label, satellite)
-        elif topic == TOPIC_ALARM_SET:
-            data = None
-            try:
-                data = json.loads(payload)
-            except Exception:  # noqa: BLE001
-                pass
-            if isinstance(data, dict):
-                clock_time = str(data.get("clock_time", ""))
-                label = str(data.get("label", "alarm"))
-                satellite = str(data.get("satellite", "tails1154"))
-            else:
-                clock_time, label, satellite = payload, "alarm", "tails1154"
-            print(f"MQTT set_alarm {clock_time} '{label}' -> {satellite}", flush=True)
-            set_alarm(clock_time, label, satellite)
-        elif topic == TOPIC_TIMER_CANCEL:
-            data = None
-            try:
-                data = json.loads(payload)
-            except Exception:  # noqa: BLE001
-                pass
-            tid = data.get("id") if isinstance(data, dict) else payload
-            print(f"MQTT cancel_timer {tid}", flush=True)
-            cancel_timer(str(tid))
-        elif topic == TOPIC_TIMER_MODIFY:
-            data = json.loads(payload)
-            print(f"MQTT modify_timer {data.get('id')}", flush=True)
-            modify_timer(
-                str(data.get("id", "")),
-                seconds=data.get("seconds"),
-                label=data.get("label"),
-                satellite=data.get("satellite"),
-            )
-        elif topic == TOPIC_DISMISS:
-            print("MQTT dismiss", flush=True)
-            _mqtt_pub("alarm/dismiss", "dismiss")
-        _mqtt_publish_timer_state()
-    except Exception as e:  # noqa: BLE001
-        print(f"MQTT handler error on {topic}: {e}", flush=True)
+                print(f"MQTT modify_timer {data.get('id')}", flush=True)
+                modify_timer(
+                    str(data.get("id", "")),
+                    seconds=data.get("seconds"),
+                    label=data.get("label"),
+                    satellite=data.get("satellite"),
+                )
+            elif topic == TOPIC_TIMER_CLEAR:
+                print("MQTT clear_timers", flush=True)
+                clear_timers()
+            elif topic == TOPIC_ANNOUNCE:
+                data = None
+                try:
+                    data = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                if isinstance(data, dict):
+                    satellite = str(data.get("satellite", "tails1154"))
+                    message = str(data.get("message", ""))
+                else:
+                    satellite, message = "tails1154", payload
+                print(f"MQTT announce [{satellite}]: {message}", flush=True)
+                satellite_announce(satellite, message)
+            elif topic == TOPIC_DISMISS:
+                print("MQTT dismiss", flush=True)
+                _mqtt_pub("alarm/dismiss", "dismiss")
+            _mqtt_publish_timer_state()
+        except Exception as e:  # noqa: BLE001
+            print(f"MQTT handler error on {topic}: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -551,18 +579,11 @@ def _fire_timer(tid: str, t: Optional[Dict[str, Any]] = None) -> None:
     if not t:
         return
     label = t.get("label") or "timer"
-    satellite = t.get("satellite", "tails1154")
-    entity = SATELLITES.get(satellite.strip().lower())
     print(f"TIMER FIRED: {label}", flush=True)
-    # ring the Pi alarm clock buzzer (via MQTT) so the physical alarm sounds
+    # Ring the Pi alarm clock buzzer (via MQTT) — alarms go through the physical
+    # alarm clock, not a satellite TTS announce. Rings until dismissed
+    # (physical button on the Pi, or POST /dismiss / MQTT claw/dismiss).
     _mqtt_pub("alarm/ring", "ring")
-    if entity:
-        _ha_call(
-            "assist_satellite/announce",
-            {"entity_id": entity, "message": f"Timer. {label}", "preannounce": False},
-        )
-    else:
-        play_music("https://actions.google.com/sounds/v1/alarms/beep_short.ogg")
 
 
 def _timer_worker() -> None:
@@ -679,6 +700,15 @@ def list_timers() -> Dict[str, Any]:
     return {"ok": True, "timers": out}
 
 
+def clear_timers() -> Dict[str, Any]:
+    """Cancel ALL alarms and timers at once."""
+    with _timer_lock:
+        count = len(_timers)
+        _timers.clear()
+    _mqtt_publish_timer_state()
+    return {"ok": True, "cleared": count}
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -705,6 +735,7 @@ server.add_tool(set_alarm, name="set_alarm", description=set_alarm.__doc__)
 server.add_tool(cancel_timer, name="cancel_timer", description=cancel_timer.__doc__)
 server.add_tool(modify_timer, name="modify_timer", description=modify_timer.__doc__)
 server.add_tool(list_timers, name="list_timers", description=list_timers.__doc__)
+server.add_tool(clear_timers, name="clear_timers", description=clear_timers.__doc__)
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +824,10 @@ async def http_list_timers(request: Request) -> Response:
     return JSONResponse(list_timers())
 
 
+async def http_clear_timers(request: Request) -> Response:
+    return JSONResponse(clear_timers())
+
+
 async def http_cancel_timer(request: Request) -> Response:
     timer_id = request.path_params.get("timer_id", "")
     result = cancel_timer(timer_id)
@@ -824,13 +859,18 @@ async def http_dismiss(request: Request) -> Response:
 app.add_route("/timer", http_set_timer, methods=["POST"])
 app.add_route("/alarm", http_set_alarm, methods=["POST"])
 app.add_route("/timers", http_list_timers, methods=["GET"])
+app.add_route("/timers", http_clear_timers, methods=["DELETE"])
 app.add_route("/timer/{timer_id}", http_cancel_timer, methods=["DELETE"])
 app.add_route("/timer/{timer_id}", http_modify_timer, methods=["PATCH"])
 app.add_route("/dismiss", http_dismiss, methods=["POST"])
 
 
+_mqtt_command_queue: "queue.Queue" = queue.Queue()
+
+
 def main() -> None:
     _mqtt_ensure()  # connect to MQTT broker + publish HA discovery + subscribe commands
+    threading.Thread(target=_mqtt_command_worker, daemon=True).start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 
