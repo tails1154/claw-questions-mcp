@@ -261,37 +261,278 @@ def satellite_list() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# MQTT (rings the Pi alarm clock buzzer)
+# MQTT (rings the Pi alarm clock buzzer + HA command bridge)
 # ---------------------------------------------------------------------------
+#
+# Topics (HA -> server, subscribed):
+#   claw/timer/set      {"seconds": 300, "label": "...", "satellite": "..."}  or plain seconds
+#   claw/alarm/set      {"clock_time": "07:30", "label": "...", "satellite": "..."}  or plain "07:30"
+#   claw/timer/cancel   {"id": "t1"}  or plain "t1"
+#   claw/timer/modify   {"id": "t1", "seconds": 600, ...}
+#   claw/dismiss        anything
+#
+# Topics (server -> HA, published):
+#   claw/timers/state   retained JSON {"count": N, "timers": [...]}
+#   claw/status         retained "online" / LWT "offline"
+#
+# MQTT Discovery configs are published under homeassistant/ so HA auto-creates
+# entities (sensor, text x3, button, binary_sensor) — no custom integration.
+
+MQTT_BROKER = "192.168.0.149"
+MQTT_PORT = 1883
+MQTT_USER = "serverstatus"
+MQTT_PASS = "serverstatus"
+
+TOPIC_TIMER_SET = "claw/timer/set"
+TOPIC_ALARM_SET = "claw/alarm/set"
+TOPIC_TIMER_CANCEL = "claw/timer/cancel"
+TOPIC_TIMER_MODIFY = "claw/timer/modify"
+TOPIC_DISMISS = "claw/dismiss"
+TOPIC_TIMER_STATE = "claw/timers/state"
+TOPIC_STATUS = "claw/status"
+
+SUB_TOPICS = [
+    TOPIC_TIMER_SET,
+    TOPIC_ALARM_SET,
+    TOPIC_TIMER_CANCEL,
+    TOPIC_TIMER_MODIFY,
+    TOPIC_DISMISS,
+]
 
 _mqtt_client = None
 _mqtt_lock = threading.Lock()
 
 
-
-def _mqtt_pub(topic: str, payload: str) -> bool:
+def _mqtt_ensure() -> bool:
+    """Create (once) and return the persistent MQTT client. Safe to call from any thread."""
     global _mqtt_client
     with _mqtt_lock:
-        if _mqtt_client is None:
-            try:
-                import paho.mqtt.client as mqtt  # noqa: PLC0415
-                c = mqtt.Client(client_id="claw_questions", protocol=mqtt.MQTTv311)
-                c.username_pw_set("serverstatus", "serverstatus")
-                c.connect("192.168.0.149", 1883, 5)
-                c.loop_start()
-                time.sleep(0.5)  # let the network loop establish
-                _mqtt_client = c
-            except Exception as e:  # noqa: BLE001
-                print(f"MQTT init failed: {e}", flush=True)
-                return False
+        if _mqtt_client is not None:
+            return True
         try:
-            info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
-            info.wait_for_publish(timeout=5)
+            import paho.mqtt.client as mqtt  # noqa: PLC0415
+            c = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                client_id="claw_questions",
+                protocol=mqtt.MQTTv311,
+            )
+            c.username_pw_set(MQTT_USER, MQTT_PASS)
+            c.will_set(TOPIC_STATUS, "offline", qos=1, retain=True)
+            c.on_connect = _mqtt_on_connect
+            c.on_message = _mqtt_on_message
+            c.connect(MQTT_BROKER, MQTT_PORT, 60)
+            c.loop_start()
+            _mqtt_client = c
             return True
         except Exception as e:  # noqa: BLE001
-            print(f"MQTT publish failed: {e}", flush=True)
-            _mqtt_client = None
+            print(f"MQTT init failed: {e}", flush=True)
             return False
+
+
+def _mqtt_on_connect(client, userdata, flags, reason_code, properties=None):
+    if getattr(reason_code, "is_failure", False):
+        print(f"MQTT connect failed: {reason_code}", flush=True)
+        return
+    print("MQTT connected", flush=True)
+    for topic in SUB_TOPICS:
+        client.subscribe(topic, qos=1)
+    # Do NOT block the network loop here (no wait_for_publish): spawn a thread.
+    client.publish(TOPIC_STATUS, "online", qos=1, retain=True)
+    threading.Thread(target=_mqtt_on_connect_post, daemon=True).start()
+
+
+def _mqtt_on_connect_post() -> None:
+    """Run after connect on a separate thread: discovery + timer state (blocking OK)."""
+    _mqtt_publish_discovery()
+    _mqtt_publish_timer_state()
+
+
+def _mqtt_pub(topic: str, payload: str, retain: bool = False) -> bool:
+    if not _mqtt_ensure():
+        return False
+    try:
+        info = _mqtt_client.publish(topic, payload, qos=1, retain=retain)
+        info.wait_for_publish(timeout=5)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"MQTT publish failed: {e}", flush=True)
+        return False
+
+
+# --- timer state + discovery -------------------------------------------------
+
+_DEVICE = {
+    "identifiers": ["claw_questions_mcp"],
+    "name": "Claw Questions",
+    "manufacturer": "tails1154",
+    "model": "claw-questions-mcp",
+    "sw_version": "1.1.0",
+}
+
+
+def _mqtt_discovery(component: str, obj_id: str, name: str, **extra) -> str:
+    payload = {
+        "name": name,
+        "unique_id": f"claw_{obj_id}",
+        "device": _DEVICE,
+        **extra,
+    }
+    return json.dumps(payload)
+
+
+def _mqtt_publish_discovery() -> None:
+    """Publish retained MQTT discovery configs so HA auto-creates entities."""
+    try:
+        _mqtt_pub(
+            "homeassistant/sensor/claw_timers/config",
+            _mqtt_discovery(
+                "sensor", "active_timers", "Claw Active Timers",
+                state_topic=TOPIC_TIMER_STATE,
+                value_template="{{ value_json.count }}",
+                json_attributes_topic=TOPIC_TIMER_STATE,
+                json_attributes_template='{"timers": {{ value_json.timers | tojson }}}',
+                unit_of_measurement="timers",
+                icon="mdi:timer-outline",
+            ),
+            retain=True,
+        )
+        _mqtt_pub(
+            "homeassistant/text/claw_timer_set/config",
+            _mqtt_discovery(
+                "text", "set_timer", "Claw Set Timer (seconds)",
+                command_topic=TOPIC_TIMER_SET,
+                mode="text",
+                icon="mdi:timer-plus-outline",
+            ),
+            retain=True,
+        )
+        _mqtt_pub(
+            "homeassistant/text/claw_alarm_set/config",
+            _mqtt_discovery(
+                "text", "set_alarm", "Claw Set Alarm (HH:MM)",
+                command_topic=TOPIC_ALARM_SET,
+                mode="text",
+                icon="mdi:alarm",
+            ),
+            retain=True,
+        )
+        _mqtt_pub(
+            "homeassistant/text/claw_timer_cancel/config",
+            _mqtt_discovery(
+                "text", "cancel_timer", "Claw Cancel Timer (id)",
+                command_topic=TOPIC_TIMER_CANCEL,
+                mode="text",
+                icon="mdi:timer-off-outline",
+            ),
+            retain=True,
+        )
+        _mqtt_pub(
+            "homeassistant/button/claw_dismiss/config",
+            _mqtt_discovery(
+                "button", "dismiss", "Claw Dismiss Alarm",
+                command_topic=TOPIC_DISMISS,
+                payload_press="dismiss",
+                icon="mdi:alarm-off",
+            ),
+            retain=True,
+        )
+        _mqtt_pub(
+            "homeassistant/binary_sensor/claw_bridge/config",
+            _mqtt_discovery(
+                "binary_sensor", "bridge_online", "Claw Bridge Online",
+                state_topic=TOPIC_STATUS,
+                payload_on="online",
+                payload_off="offline",
+                device_class="connectivity",
+            ),
+            retain=True,
+        )
+        print("MQTT discovery published", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"MQTT discovery failed: {e}", flush=True)
+
+
+def _mqtt_publish_timer_state() -> None:
+    now = time.time()
+    timers = []
+    with _timer_lock:
+        for tid, t in list(_timers.items()):
+            timers.append({
+                "id": tid,
+                "kind": t.get("kind"),
+                "label": t.get("label"),
+                "remaining": max(0, t["due"] - now),
+                "satellite": t.get("satellite"),
+            })
+    payload = json.dumps({"count": len(timers), "timers": timers})
+    _mqtt_pub(TOPIC_TIMER_STATE, payload, retain=True)
+
+
+# --- command handlers ---------------------------------------------------------
+
+def _payload_text(payload) -> str:
+    if isinstance(payload, bytes):
+        return payload.decode(errors="replace").strip()
+    return str(payload).strip()
+
+
+def _mqtt_on_message(client, userdata, msg):
+    topic = msg.topic
+    payload = _payload_text(msg.payload)
+    try:
+        if topic == TOPIC_TIMER_SET:
+            data = None
+            try:
+                data = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                pass
+            if isinstance(data, dict):
+                seconds = float(data.get("seconds", 0))
+                label = str(data.get("label", "timer"))
+                satellite = str(data.get("satellite", "tails1154"))
+            else:
+                seconds = float(payload)
+                label, satellite = "timer", "tails1154"
+            print(f"MQTT set_timer {seconds}s '{label}' -> {satellite}", flush=True)
+            set_timer(seconds, label, satellite)
+        elif topic == TOPIC_ALARM_SET:
+            data = None
+            try:
+                data = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                pass
+            if isinstance(data, dict):
+                clock_time = str(data.get("clock_time", ""))
+                label = str(data.get("label", "alarm"))
+                satellite = str(data.get("satellite", "tails1154"))
+            else:
+                clock_time, label, satellite = payload, "alarm", "tails1154"
+            print(f"MQTT set_alarm {clock_time} '{label}' -> {satellite}", flush=True)
+            set_alarm(clock_time, label, satellite)
+        elif topic == TOPIC_TIMER_CANCEL:
+            data = None
+            try:
+                data = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                pass
+            tid = data.get("id") if isinstance(data, dict) else payload
+            print(f"MQTT cancel_timer {tid}", flush=True)
+            cancel_timer(str(tid))
+        elif topic == TOPIC_TIMER_MODIFY:
+            data = json.loads(payload)
+            print(f"MQTT modify_timer {data.get('id')}", flush=True)
+            modify_timer(
+                str(data.get("id", "")),
+                seconds=data.get("seconds"),
+                label=data.get("label"),
+                satellite=data.get("satellite"),
+            )
+        elif topic == TOPIC_DISMISS:
+            print("MQTT dismiss", flush=True)
+            _mqtt_pub("alarm/dismiss", "dismiss")
+        _mqtt_publish_timer_state()
+    except Exception as e:  # noqa: BLE001
+        print(f"MQTT handler error on {topic}: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +578,8 @@ def _timer_worker() -> None:
                 if t and t.get("repeat", 0) > 0:
                     t["due"] = now + t["repeat"]
                     _timers[tid] = t
+        if fired:
+            _mqtt_publish_timer_state()
         for tid, t in fired:
             _fire_timer(tid, t)
         time.sleep(1)
@@ -361,6 +604,7 @@ def set_timer(seconds: float, label: str = "timer", satellite: str = "tails1154"
             "repeat": 0,
             "created": time.time(),
         }
+    _mqtt_publish_timer_state()
     return {"ok": True, "id": tid, "kind": "timer", "due_in": seconds, "label": label}
 
 
@@ -390,6 +634,7 @@ def set_alarm(clock_time: str, label: str = "alarm", satellite: str = "tails1154
             "repeat": 0,
             "created": time.time(),
         }
+    _mqtt_publish_timer_state()
     return {"ok": True, "id": tid, "kind": "alarm", "due_in": seconds, "at": clock_time, "label": label}
 
 
@@ -399,6 +644,7 @@ def cancel_timer(timer_id: str) -> Dict[str, Any]:
         t = _timers.pop(timer_id, None)
     if t is None:
         return {"ok": False, "error": f"no timer with id {timer_id}"}
+    _mqtt_publish_timer_state()
     return {"ok": True, "cancelled": timer_id, "label": t.get("label")}
 
 
@@ -415,6 +661,7 @@ def modify_timer(timer_id: str, seconds: Optional[float] = None, label: Optional
             t["label"] = label
         if satellite is not None:
             t["satellite"] = satellite
+    _mqtt_publish_timer_state()
     return {"ok": True, "id": timer_id, "label": t.get("label"), "due_in": max(0, t["due"] - time.time())}
 
 
@@ -583,6 +830,7 @@ app.add_route("/dismiss", http_dismiss, methods=["POST"])
 
 
 def main() -> None:
+    _mqtt_ensure()  # connect to MQTT broker + publish HA discovery + subscribe commands
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 
