@@ -18,6 +18,8 @@ import os
 import re
 import signal
 import subprocess
+import threading
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -259,6 +261,141 @@ def satellite_list() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Alarms & timers (run in-process; fire a TTS announce + optional music)
+# ---------------------------------------------------------------------------
+
+_timers: Dict[str, Dict[str, Any]] = {}
+_timer_seq = 0
+_timer_lock = threading.Lock()
+
+
+def _fire_timer(tid: str) -> None:
+    with _timer_lock:
+        t = _timers.get(tid)
+    if not t:
+        return
+    label = t.get("label") or "timer"
+    satellite = t.get("satellite", "tails1154")
+    entity = SATELLITES.get(satellite.strip().lower())
+    print(f"TIMER FIRED: {label}", flush=True)
+    if entity:
+        _ha_call(
+            "assist_satellite/announce",
+            {"entity_id": entity, "message": f"Timer. {label}", "preannounce": False},
+        )
+    else:
+        play_music("https://actions.google.com/sounds/v1/alarms/beep_short.ogg")
+
+
+def _timer_worker() -> None:
+    while True:
+        now = time.time()
+        fired = []
+        with _timer_lock:
+            for tid, t in list(_timers.items()):
+                if not t.get("paused") and now >= t.get("due", 0):
+                    fired.append(tid)
+            for tid in fired:
+                t = _timers.pop(tid, None)
+                if t and t.get("repeat", 0) > 0:
+                    t["due"] = now + t["repeat"]
+                    _timers[tid] = t
+        for tid in fired:
+            _fire_timer(tid)
+        time.sleep(1)
+
+
+threading.Thread(target=_timer_worker, daemon=True).start()
+
+
+def set_timer(seconds: float, label: str = "timer", satellite: str = "tails1154") -> Dict[str, Any]:
+    """Set a countdown timer (seconds). Fires TTS on the satellite when done."""
+    global _timer_seq
+    seconds = float(seconds)
+    with _timer_lock:
+        _timer_seq += 1
+        tid = f"t{_timer_seq}"
+        _timers[tid] = {
+            "kind": "timer",
+            "due": time.time() + seconds,
+            "label": label,
+            "satellite": satellite,
+            "paused": False,
+            "repeat": 0,
+            "created": time.time(),
+        }
+    return {"ok": True, "id": tid, "kind": "timer", "due_in": seconds, "label": label}
+
+
+def set_alarm(clock_time: str, label: str = "alarm", satellite: str = "tails1154") -> Dict[str, Any]:
+    """Set an alarm at a wall-clock time like '07:30'. Fires TTS on the satellite."""
+    global _timer_seq
+    try:
+        import datetime as _dt
+        hh, mm = clock_time.strip().split(":")
+        hh, mm = int(hh), int(mm)
+        now = _dt.datetime.now()
+        due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if due <= now:
+            due += _dt.timedelta(days=1)  # tomorrow if already past
+        seconds = (due - now).total_seconds()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"bad time '{clock_time}': {e}"}
+    with _timer_lock:
+        _timer_seq += 1
+        tid = f"t{_timer_seq}"
+        _timers[tid] = {
+            "kind": "alarm",
+            "due": time.time() + seconds,
+            "label": label,
+            "satellite": satellite,
+            "paused": False,
+            "repeat": 0,
+            "created": time.time(),
+        }
+    return {"ok": True, "id": tid, "kind": "alarm", "due_in": seconds, "at": clock_time, "label": label}
+
+
+def cancel_timer(timer_id: str) -> Dict[str, Any]:
+    """Cancel an alarm/timer by id."""
+    with _timer_lock:
+        t = _timers.pop(timer_id, None)
+    if t is None:
+        return {"ok": False, "error": f"no timer with id {timer_id}"}
+    return {"ok": True, "cancelled": timer_id, "label": t.get("label")}
+
+
+def modify_timer(timer_id: str, seconds: Optional[float] = None, label: Optional[str] = None,
+                 satellite: Optional[str] = None) -> Dict[str, Any]:
+    """Modify a timer: change countdown (seconds), label, or satellite."""
+    with _timer_lock:
+        t = _timers.get(timer_id)
+        if t is None:
+            return {"ok": False, "error": f"no timer with id {timer_id}"}
+        if seconds is not None:
+            t["due"] = time.time() + float(seconds)
+        if label is not None:
+            t["label"] = label
+        if satellite is not None:
+            t["satellite"] = satellite
+    return {"ok": True, "id": timer_id, "label": t.get("label"), "due_in": max(0, t["due"] - time.time())}
+
+
+def list_timers() -> Dict[str, Any]:
+    """List active alarms/timers."""
+    now = time.time()
+    out = []
+    with _timer_lock:
+        for tid, t in list(_timers.items()):
+            out.append({
+                "id": tid, "kind": t.get("kind"), "label": t.get("label"),
+                "remaining": max(0, t["due"] - now),
+                "satellite": t.get("satellite"),
+            })
+    return {"ok": True, "timers": out}
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
@@ -279,6 +416,11 @@ server.add_tool(ask_question, name="ask_question", description=ask_question.__do
 server.add_tool(get_answer, name="get_answer", description=get_answer.__doc__)
 server.add_tool(satellite_announce, name="satellite_announce", description=satellite_announce.__doc__)
 server.add_tool(satellite_list, name="satellite_list", description=satellite_list.__doc__)
+server.add_tool(set_timer, name="set_timer", description=set_timer.__doc__)
+server.add_tool(set_alarm, name="set_alarm", description=set_alarm.__doc__)
+server.add_tool(cancel_timer, name="cancel_timer", description=cancel_timer.__doc__)
+server.add_tool(modify_timer, name="modify_timer", description=modify_timer.__doc__)
+server.add_tool(list_timers, name="list_timers", description=list_timers.__doc__)
 
 
 # ---------------------------------------------------------------------------
